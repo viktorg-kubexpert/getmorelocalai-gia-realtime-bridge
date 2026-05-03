@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: getmorelocalai-gia-realtime-bridge
+    env: node
+    plan: starter
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OPENAI_REALTIME_MODEL
+        value: gpt-4o-realtime-preview
+      - key: OPENAI_SUMMARY_MODEL
+        value: gpt-4o-mini
+      - key: GIA_VOICE
+        value: alloy
+      - key: GIA_MAX_CALL_SECONDS
+        value: "420"
+      - key: SEND_SUMMARY_EMAIL
+        value: "true"
+      - key: SMTP_HOST
+        value: gator4126.hostgator.com
+      - key: SMTP_PORT
+        value: "465"
+      - key: SMTP_USER
+        value: agent@getmorelocalai.com
+      - key: MAIL_FROM
+        value: agent@getmorelocalai.com
+      - key: MAIL_TO
+        value: info@getmorelocalai.com

@@ -1,0 +1,22 @@
+{
+  "name": "getmorelocalai-gia-realtime-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Gia realtime voice bridge for GetMoreLocalAI: Twilio Media Streams <-> OpenAI Realtime API.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js",
+    "smoke": "node scripts/smoke-local.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/websocket": "^11.0.2",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "nodemailer": "^6.10.0",
+    "twilio": "^5.4.5",
+    "ws": "^8.18.0"
+  }
+}

@@ -22,9 +22,11 @@ const MAX_TRANSCRIPT_ITEMS = Number(process.env.GIA_MAX_TRANSCRIPT_ITEMS || 80);
 const VAD_THRESHOLD = Number(process.env.GIA_VAD_THRESHOLD || 0.75);
 const VAD_PREFIX_PADDING_MS = Number(process.env.GIA_VAD_PREFIX_PADDING_MS || 450);
 const VAD_SILENCE_DURATION_MS = Number(process.env.GIA_VAD_SILENCE_DURATION_MS || 1000);
-const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 3);
-const UNCLEAR_FALLBACK_COOLDOWN_MS = Number(process.env.GIA_UNCLEAR_FALLBACK_COOLDOWN_MS || 25000);
-const END_CALL_DELAY_MS = Number(process.env.GIA_END_CALL_DELAY_MS || 2500);
+const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 6);
+const UNCLEAR_FALLBACK_COOLDOWN_MS = Number(process.env.GIA_UNCLEAR_FALLBACK_COOLDOWN_MS || 60000);
+const UNCLEAR_FORCE_FALLBACK = String(process.env.GIA_UNCLEAR_FORCE_FALLBACK || 'false').toLowerCase() === 'true';
+const END_CALL_DELAY_MS = Number(process.env.GIA_END_CALL_DELAY_MS || 6000);
+const END_CALL_FALLBACK_DELAY_MS = Number(process.env.GIA_END_CALL_FALLBACK_DELAY_MS || 12000);
 const AUDIO_MODE = (process.env.GIA_AUDIO_MODE || '').toLowerCase() || (String(process.env.GIA_ECHO_SUPPRESSION || 'true').toLowerCase() === 'false' ? 'full_duplex' : 'half_duplex');
 const ECHO_SUPPRESSION_ENABLED = AUDIO_MODE !== 'full_duplex' && String(process.env.GIA_ECHO_SUPPRESSION || 'true').toLowerCase() !== 'false';
 const ECHO_RESUME_DELAY_MS = Number(process.env.GIA_ECHO_RESUME_DELAY_MS || 650);
@@ -45,7 +47,7 @@ Collect when natural: caller name, business name, location, website, best callba
 
 Guardrails: never ask for or accept passwords, API keys, payment cards, private credentials, SSNs, medical/legal sensitive details, or Google/Twilio/WordPress logins. If volunteered, tell them not to share credentials and move on. Do not promise guaranteed leads or fixed pricing; say pricing is scoped after the free audit. If caller asks for a human, collect callback details and preferred time. If unsure, offer a free audit or callback.
 
-Unclear-audio handling: do not mention noise unless the caller audio is repeatedly unusable. For one missed or partial utterance, use a neutral clarification such as, "Sorry, I missed part of that — could you repeat the main issue?" If understanding fails repeatedly, switch to fallback capture without blaming the caller: say, "I may be missing part of what you're saying. I can still help — what's the best callback number or email so the team can follow up?" Then collect only callback details and preferred time. Treat short normal answers like yes, no, okay, bye, thanks, and all set as valid caller input, not unclear audio.
+Unclear-audio handling: outdoors, traffic, wind, and speakerphone audio are normal. Do not repeatedly apologize or say the line is noisy. If one utterance is unclear, ask a simple content-based follow-up such as, "Could you repeat that last part?" or "What kind of business is this for?" Only after several failed attempts should you collect a callback number or email so the team can follow up. Do not use the phrase "I may be missing part of what you're saying" unless explicitly instructed by the system. Treat short normal answers like yes, no, okay, bye, thanks, and all set as valid caller input, not unclear audio.
 
 Close: when enough info is collected or caller wants to end, say exactly one brief friendly closing sentence such as, "Thanks for calling GetMoreLocalAI. Have a nice day." Then call the end_call tool. If the caller says goodbye, bye, thanks, that's all, no more questions, or clearly ends the conversation, acknowledge briefly with "Thanks for calling GetMoreLocalAI. Have a nice day." and call the end_call tool. Do not leave the line open after the conversation is finished.`;
 
@@ -92,6 +94,7 @@ fastify.all('/twilio/voice', async (req, reply) => {
 fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   const connId = Math.random().toString(36).slice(2, 10);
   let streamSid = null, callSid = null, caller = 'unknown', openaiSocket = null, openaiReady = false, ended = false, lastResponseId = null, unclearCount = 0, lastUnclearPromptAt = 0;
+  let pendingEndCallReason = '', pendingEndCallTimer = null;
   let assistantSpeaking = false, echoIgnoreUntil = 0, pendingEchoMarkTimer = null, echoMarkSeq = 0, lastAssistantAudioAt = 0;
   const transcript = [];
   const startedAt = Date.now();
@@ -149,9 +152,9 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
     unclearCount += 1;
     const now = Date.now();
     log.info({ source, unclearCount }, 'unclear caller audio detected');
-    if (unclearCount >= UNCLEAR_REPEAT_LIMIT && now - lastUnclearPromptAt > UNCLEAR_FALLBACK_COOLDOWN_MS) {
+    if (UNCLEAR_FORCE_FALLBACK && unclearCount >= UNCLEAR_REPEAT_LIMIT && now - lastUnclearPromptAt > UNCLEAR_FALLBACK_COOLDOWN_MS) {
       lastUnclearPromptAt = now;
-      sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller audio or transcription has failed repeatedly. Do not say the line is noisy unless the caller explicitly sounds noisy. Use fallback capture now: say you may be missing part of what they are saying, ask for the best callback number or email, and avoid guessing details.' }] } });
+      sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: Transcription has failed several times. Keep the next reply short and natural. Ask one simple clarifying question, or collect the best callback number/email if a conversation is not workable. Do not say the line is noisy and do not use the phrase "I may be missing part of what you are saying."' }] } });
       sendToOpenAI({ type: 'response.create' });
     }
   }
@@ -161,11 +164,21 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   }
   function scheduleEndCall(reason) {
     if (ended) return;
-    log.info({ reason, delayMs: END_CALL_DELAY_MS }, 'scheduling Gia call hangup');
+    pendingEndCallReason = reason || 'gia_end_call_tool';
+    log.info({ reason: pendingEndCallReason, delayMs: END_CALL_DELAY_MS, fallbackDelayMs: END_CALL_FALLBACK_DELAY_MS }, 'Gia end_call requested; waiting for final response audio before hangup');
+    if (pendingEndCallTimer) clearTimeout(pendingEndCallTimer);
+    pendingEndCallTimer = setTimeout(() => endCall(pendingEndCallReason), END_CALL_FALLBACK_DELAY_MS);
+  }
+  function schedulePendingEndCallAfterResponse() {
+    if (!pendingEndCallReason || ended) return;
+    const reason = pendingEndCallReason;
+    pendingEndCallReason = '';
+    if (pendingEndCallTimer) { clearTimeout(pendingEndCallTimer); pendingEndCallTimer = null; }
+    log.info({ reason, delayMs: END_CALL_DELAY_MS }, 'scheduling Gia hangup after final response completed');
     setTimeout(() => endCall(reason), END_CALL_DELAY_MS);
   }
   function endCall(reason) {
-    if (ended) return; ended = true; clearTimeout(callTimer); log.info({ reason, callSid }, 'ending Gia realtime call');
+    if (ended) return; ended = true; clearTimeout(callTimer); if (pendingEndCallTimer) clearTimeout(pendingEndCallTimer); log.info({ reason, callSid }, 'ending Gia realtime call');
     try { if (streamSid) sendToTwilio({ event: 'clear', streamSid }); } catch {}
     try { twilioSocket.close(); } catch {}
     try { openaiSocket?.close(); } catch {}
@@ -183,6 +196,7 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     switch (msg.type) {
       case 'response.created': lastResponseId = msg.response?.id || lastResponseId; break;
+      case 'response.done': schedulePendingEndCallAfterResponse(); break;
       case 'response.audio.delta': if (msg.delta && streamSid) { noteAssistantAudioQueued(); sendToTwilio({ event: 'media', streamSid, media: { payload: msg.delta } }); } break;
       case 'response.audio_transcript.done': case 'response.output_text.done': pushTranscript('gia', msg.transcript || msg.text || ''); break;
       case 'response.function_call_arguments.done': {

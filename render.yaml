@@ -28,9 +28,15 @@ services:
       - key: GIA_ECHO_MAX_MUTE_MS
         value: "8000"
       - key: GIA_UNCLEAR_REPEAT_LIMIT
-        value: "3"
+        value: "6"
       - key: GIA_UNCLEAR_FALLBACK_COOLDOWN_MS
-        value: "25000"
+        value: "60000"
+      - key: GIA_UNCLEAR_FORCE_FALLBACK
+        value: "false"
+      - key: GIA_END_CALL_DELAY_MS
+        value: "6000"
+      - key: GIA_END_CALL_FALLBACK_DELAY_MS
+        value: "12000"
       - key: SEND_SUMMARY_EMAIL
         value: "true"
       - key: SMTP_HOST

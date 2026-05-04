@@ -17,6 +17,16 @@ services:
         value: alloy
       - key: GIA_MAX_CALL_SECONDS
         value: "420"
+      - key: GIA_AUDIO_MODE
+        value: half_duplex
+      - key: GIA_ECHO_SUPPRESSION
+        value: "true"
+      - key: GIA_ECHO_RESUME_DELAY_MS
+        value: "650"
+      - key: GIA_ECHO_MARK_DEBOUNCE_MS
+        value: "120"
+      - key: GIA_ECHO_MAX_MUTE_MS
+        value: "8000"
       - key: SEND_SUMMARY_EMAIL
         value: "true"
       - key: SMTP_HOST

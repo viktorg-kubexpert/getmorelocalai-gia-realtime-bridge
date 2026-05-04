@@ -24,6 +24,11 @@ const VAD_PREFIX_PADDING_MS = Number(process.env.GIA_VAD_PREFIX_PADDING_MS || 45
 const VAD_SILENCE_DURATION_MS = Number(process.env.GIA_VAD_SILENCE_DURATION_MS || 1000);
 const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 2);
 const END_CALL_DELAY_MS = Number(process.env.GIA_END_CALL_DELAY_MS || 2500);
+const AUDIO_MODE = (process.env.GIA_AUDIO_MODE || '').toLowerCase() || (String(process.env.GIA_ECHO_SUPPRESSION || 'true').toLowerCase() === 'false' ? 'full_duplex' : 'half_duplex');
+const ECHO_SUPPRESSION_ENABLED = AUDIO_MODE !== 'full_duplex' && String(process.env.GIA_ECHO_SUPPRESSION || 'true').toLowerCase() !== 'false';
+const ECHO_RESUME_DELAY_MS = Number(process.env.GIA_ECHO_RESUME_DELAY_MS || 650);
+const ECHO_MARK_DEBOUNCE_MS = Number(process.env.GIA_ECHO_MARK_DEBOUNCE_MS || 120);
+const ECHO_MAX_MUTE_MS = Number(process.env.GIA_ECHO_MAX_MUTE_MS || 8000);
 
 const GIA_INSTRUCTIONS = `You are Gia, GetMoreLocalAI's transparent AI growth assistant on an inbound phone call.
 
@@ -57,7 +62,7 @@ function validateTwilioHttp(req) {
   return twilio.validateRequest(authToken, signature, url, req.body || {});
 }
 
-fastify.get('/healthz', async () => ({ ok: true, service: 'gia-realtime-bridge', realtimeModel: REALTIME_MODEL, publicBaseConfigured: Boolean(PUBLIC_BASE_URL), openaiConfigured: Boolean(OPENAI_API_KEY), mailConfigured: Boolean(process.env.SMTP_PASS) }));
+fastify.get('/healthz', async () => ({ ok: true, service: 'gia-realtime-bridge', realtimeModel: REALTIME_MODEL, audioMode: AUDIO_MODE, echoSuppressionEnabled: ECHO_SUPPRESSION_ENABLED, publicBaseConfigured: Boolean(PUBLIC_BASE_URL), openaiConfigured: Boolean(OPENAI_API_KEY), mailConfigured: Boolean(process.env.SMTP_PASS) }));
 
 fastify.all('/twilio/voice', async (req, reply) => {
   if (!validateTwilioHttp(req)) {
@@ -86,6 +91,7 @@ fastify.all('/twilio/voice', async (req, reply) => {
 fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   const connId = Math.random().toString(36).slice(2, 10);
   let streamSid = null, callSid = null, caller = 'unknown', openaiSocket = null, openaiReady = false, ended = false, lastResponseId = null, unclearCount = 0, lastUnclearPromptAt = 0;
+  let assistantSpeaking = false, echoIgnoreUntil = 0, pendingEchoMarkTimer = null, echoMarkSeq = 0, lastAssistantAudioAt = 0;
   const transcript = [];
   const startedAt = Date.now();
   const callTimer = setTimeout(() => endCall('max_call_seconds'), MAX_CALL_SECONDS * 1000);
@@ -93,6 +99,44 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   function pushTranscript(role, text) { const clean = safe(text, 2000); if (!clean) return; transcript.push({ ts: new Date().toISOString(), role, text: clean }); while (transcript.length > MAX_TRANSCRIPT_ITEMS) transcript.shift(); }
   function sendToTwilio(obj) { if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.send(JSON.stringify(obj)); }
   function sendToOpenAI(obj) { if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) openaiSocket.send(JSON.stringify(obj)); }
+  function echoGuardActive() {
+    if (!ECHO_SUPPRESSION_ENABLED) return false;
+    const now = Date.now();
+    if (assistantSpeaking && now - lastAssistantAudioAt > ECHO_MAX_MUTE_MS) {
+      assistantSpeaking = false;
+      echoIgnoreUntil = Math.max(echoIgnoreUntil, now + ECHO_RESUME_DELAY_MS);
+      log.warn({ maxMuteMs: ECHO_MAX_MUTE_MS }, 'Gia echo guard forced listening resume after max mute window');
+    }
+    return assistantSpeaking || now < echoIgnoreUntil;
+  }
+  function scheduleEchoPlaybackMark() {
+    if (!ECHO_SUPPRESSION_ENABLED || !streamSid) return;
+    if (pendingEchoMarkTimer) clearTimeout(pendingEchoMarkTimer);
+    pendingEchoMarkTimer = setTimeout(() => {
+      pendingEchoMarkTimer = null;
+      if (!streamSid || ended) return;
+      const name = `gia_echo_guard_${++echoMarkSeq}`;
+      sendToTwilio({ event: 'mark', streamSid, mark: { name } });
+      setTimeout(() => {
+        if (assistantSpeaking && Date.now() - lastAssistantAudioAt >= ECHO_MARK_DEBOUNCE_MS) {
+          assistantSpeaking = false;
+          echoIgnoreUntil = Math.max(echoIgnoreUntil, Date.now() + ECHO_RESUME_DELAY_MS);
+        }
+      }, ECHO_MAX_MUTE_MS).unref?.();
+    }, ECHO_MARK_DEBOUNCE_MS);
+  }
+  function noteAssistantAudioQueued() {
+    if (!ECHO_SUPPRESSION_ENABLED) return;
+    assistantSpeaking = true;
+    lastAssistantAudioAt = Date.now();
+    scheduleEchoPlaybackMark();
+  }
+  function noteAssistantPlaybackComplete(source) {
+    if (!ECHO_SUPPRESSION_ENABLED) return;
+    assistantSpeaking = false;
+    echoIgnoreUntil = Math.max(echoIgnoreUntil, Date.now() + ECHO_RESUME_DELAY_MS);
+    log.info({ source, resumeDelayMs: ECHO_RESUME_DELAY_MS }, 'Gia echo guard resumed caller listening after playback grace period');
+  }
   function isUnclearTranscript(text) {
     const t = safe(text, 200).toLowerCase();
     if (!t) return true;
@@ -137,7 +181,7 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     switch (msg.type) {
       case 'response.created': lastResponseId = msg.response?.id || lastResponseId; break;
-      case 'response.audio.delta': if (msg.delta && streamSid) sendToTwilio({ event: 'media', streamSid, media: { payload: msg.delta } }); break;
+      case 'response.audio.delta': if (msg.delta && streamSid) { noteAssistantAudioQueued(); sendToTwilio({ event: 'media', streamSid, media: { payload: msg.delta } }); } break;
       case 'response.audio_transcript.done': case 'response.output_text.done': pushTranscript('gia', msg.transcript || msg.text || ''); break;
       case 'response.function_call_arguments.done': {
         if (msg.name === 'end_call') {
@@ -148,7 +192,7 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
       }
       case 'conversation.item.input_audio_transcription.completed': { const text = msg.transcript || ''; if (isUnclearTranscript(text)) handleUnclearAudio('transcription_completed'); else { unclearCount = 0; pushTranscript('caller', text); if (callerWantsToEnd(text)) { sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller appears to be ending the conversation. Give one brief friendly closing sentence, then call the end_call tool.' }] } }); sendToOpenAI({ type: 'response.create' }); } } break; }
       case 'conversation.item.input_audio_transcription.failed': handleUnclearAudio('transcription_failed'); break;
-      case 'input_audio_buffer.speech_started': if (streamSid) sendToTwilio({ event: 'clear', streamSid }); if (lastResponseId) sendToOpenAI({ type: 'response.cancel', response_id: lastResponseId }); break;
+      case 'input_audio_buffer.speech_started': if (!echoGuardActive()) { if (streamSid) sendToTwilio({ event: 'clear', streamSid }); if (lastResponseId) sendToOpenAI({ type: 'response.cancel', response_id: lastResponseId }); } else log.info('Ignored speech_started during Gia echo guard window'); break;
       case 'error': log.error({ error: msg.error }, 'OpenAI realtime error'); break;
       default: break;
     }
@@ -162,7 +206,10 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
       const suppliedToken = msg.start?.customParameters?.bridgeToken || '';
       if (BRIDGE_TOKEN && suppliedToken !== BRIDGE_TOKEN) { log.warn('Rejected media stream: invalid bridge token'); endCall('invalid_bridge_token'); } else log.info({ streamSid, callSid, caller }, 'Twilio media stream started');
     } else if (msg.event === 'media') {
-      if (openaiReady && msg.media?.payload) sendToOpenAI({ type: 'input_audio_buffer.append', audio: msg.media.payload });
+      if (openaiReady && msg.media?.payload && !echoGuardActive()) sendToOpenAI({ type: 'input_audio_buffer.append', audio: msg.media.payload });
+    } else if (msg.event === 'mark') {
+      const name = msg.mark?.name || '';
+      if (name.startsWith('gia_echo_guard_')) noteAssistantPlaybackComplete('twilio_mark');
     } else if (msg.event === 'stop') endCall('twilio_stop');
   });
   twilioSocket.on('close', () => { if (!ended) endCall('twilio_closed'); });

@@ -37,6 +37,12 @@ services:
         value: "6000"
       - key: GIA_END_CALL_FALLBACK_DELAY_MS
         value: "12000"
+      - key: LIVE_TRANSFER_NUMBER
+        sync: false
+      - key: LIVE_TRANSFER_TIMEOUT_SECONDS
+        value: "20"
+      - key: LIVE_TRANSFER_REQUEST_LIMIT
+        value: "2"
       - key: SEND_SUMMARY_EMAIL
         value: "true"
       - key: SMTP_HOST

@@ -32,6 +32,9 @@ const ECHO_SUPPRESSION_ENABLED = AUDIO_MODE !== 'full_duplex' && String(process.
 const ECHO_RESUME_DELAY_MS = Number(process.env.GIA_ECHO_RESUME_DELAY_MS || 650);
 const ECHO_MARK_DEBOUNCE_MS = Number(process.env.GIA_ECHO_MARK_DEBOUNCE_MS || 120);
 const ECHO_MAX_MUTE_MS = Number(process.env.GIA_ECHO_MAX_MUTE_MS || 8000);
+const LIVE_TRANSFER_NUMBER = (process.env.LIVE_TRANSFER_NUMBER || '').trim();
+const LIVE_TRANSFER_TIMEOUT_SECONDS = Number(process.env.LIVE_TRANSFER_TIMEOUT_SECONDS || 20);
+const LIVE_TRANSFER_REQUEST_LIMIT = Number(process.env.LIVE_TRANSFER_REQUEST_LIMIT || 2);
 
 const GIA_INSTRUCTIONS = `You are Gia, GetMoreLocalAI's transparent AI growth assistant on an inbound phone call.
 
@@ -45,7 +48,7 @@ Main goal: demonstrate value, qualify the caller, and offer a Free AI Growth & A
 
 Collect when natural: caller name, business name, location, website, best callback phone/email, main bottleneck, service interest, urgency/timeframe. Do not interrogate; acknowledge their situation first.
 
-Guardrails: never ask for or accept passwords, API keys, payment cards, private credentials, SSNs, medical/legal sensitive details, or Google/Twilio/WordPress logins. If volunteered, tell them not to share credentials and move on. Do not promise guaranteed leads or fixed pricing; say pricing is scoped after the free audit. If caller asks for a human, collect callback details and preferred time. If unsure, offer a free audit or callback.
+Guardrails: never ask for or accept passwords, API keys, payment cards, private credentials, SSNs, medical/legal sensitive details, or Google/Twilio/WordPress logins. If volunteered, tell them not to share credentials and move on. Do not promise guaranteed leads or fixed pricing; say pricing is scoped after the free audit. If caller asks for a human, live person, customer service, support, billing, or an existing-customer issue: first offer to capture details for follow-up and ask what the call is regarding. If they ask a second time or insist, or if they say urgent, emergency, billing, support issue, existing customer, or customer service, use the transfer_to_live_person tool. If transfer is unavailable, apologize briefly and collect name, callback number/email, issue, and preferred time.
 
 Unclear-audio handling: outdoors, traffic, wind, and speakerphone audio are normal. Do not repeatedly apologize or say the line is noisy. If one utterance is unclear, ask a simple content-based follow-up such as, "Could you repeat that last part?" or "What kind of business is this for?" Only after several failed attempts should you collect a callback number or email so the team can follow up. Do not use the phrase "I may be missing part of what you're saying" unless explicitly instructed by the system. Treat short normal answers like yes, no, okay, bye, thanks, and all set as valid caller input, not unclear audio.
 
@@ -162,6 +165,38 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
     const t = safe(text, 500).toLowerCase();
     return /\b(goodbye|bye|bye bye|that'?s all|that is all|no more questions|nothing else|i'?m all set|all set|thank you,? bye|thanks,? bye|have a good (day|night|one))\b/.test(t);
   }
+  function callerWantsLivePerson(text) {
+    const t = safe(text, 500).toLowerCase();
+    return /\b(live person|real person|human|representative|agent|customer service|support|billing|existing customer|speak to someone|talk to someone|talk to a person|speak with someone|speak with a person|urgent|emergency)\b/.test(t);
+  }
+  function callerNeedsImmediateTransfer(text) {
+    const t = safe(text, 500).toLowerCase();
+    return /\b(urgent|emergency|billing|support issue|customer service|existing customer)\b/.test(t);
+  }
+  async function transferToLivePerson(reason) {
+    if (!callSid) throw new Error('missing_call_sid');
+    if (!LIVE_TRANSFER_NUMBER) throw new Error('live_transfer_number_not_configured');
+    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) throw new Error('twilio_rest_credentials_not_configured');
+    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    const timeout = Math.max(5, Math.min(60, LIVE_TRANSFER_TIMEOUT_SECONDS));
+    const fallbackTranscription = 'https://getmorelocalai-phone-2453-gmlai-184328.twil.io/transcription';
+    const fallbackRecording = 'https://getmorelocalai-phone-2453-gmlai-184328.twil.io/recording';
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Absolutely. I&apos;ll try to connect you with someone now.</Say>
+  <Dial timeout="${timeout}" answerOnBridge="true">${xmlEscape(LIVE_TRANSFER_NUMBER)}</Dial>
+  <Say voice="alice">I couldn&apos;t reach someone live. Please leave your name, number, and what you need help with after the tone.</Say>
+  <Record maxLength="120" playBeep="true" transcribe="true" transcribeCallback="${fallbackTranscription}" recordingStatusCallback="${fallbackRecording}" />
+  <Hangup />
+</Response>`;
+    await client.calls(callSid).update({ twiml });
+    pushTranscript('system', `Live transfer initiated: ${safe(reason, 200)}`);
+    void sendCallSummary({ reason: `live_transfer_${safe(reason, 80)}`, callSid, caller, startedAt, transcript }).catch(err => log.error({ err }, 'summary email failed after transfer'));
+    ended = true; clearTimeout(callTimer); if (pendingEndCallTimer) clearTimeout(pendingEndCallTimer);
+    try { twilioSocket.close(); } catch {}
+    try { openaiSocket?.close(); } catch {}
+    return true;
+  }
   function scheduleEndCall(reason) {
     if (ended) return;
     pendingEndCallReason = reason || 'gia_end_call_tool';
@@ -188,7 +223,11 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   openaiSocket = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } });
   openaiSocket.on('open', () => {
     openaiReady = true;
-    sendToOpenAI({ type: 'session.update', session: { modalities: ['text', 'audio'], instructions: GIA_INSTRUCTIONS, voice: GIA_VOICE, input_audio_format: 'g711_ulaw', output_audio_format: 'g711_ulaw', input_audio_transcription: { model: 'whisper-1' }, turn_detection: { type: 'server_vad', threshold: VAD_THRESHOLD, prefix_padding_ms: VAD_PREFIX_PADDING_MS, silence_duration_ms: VAD_SILENCE_DURATION_MS, create_response: true, interrupt_response: true }, tools: [{ type: 'function', name: 'end_call', description: 'End the phone call after Gia has given a brief closing sentence and the caller is finished.', parameters: { type: 'object', properties: { reason: { type: 'string', description: 'Short reason the call should end, such as caller_goodbye, completed_intake, callback_collected, or conversation_finished.' } }, required: ['reason'] } }], tool_choice: 'auto', temperature: 0.7, max_response_output_tokens: 700 } });
+    const realtimeTools = [
+      { type: 'function', name: 'end_call', description: 'End the phone call after Gia has given a brief closing sentence and the caller is finished.', parameters: { type: 'object', properties: { reason: { type: 'string', description: 'Short reason the call should end, such as caller_goodbye, completed_intake, callback_collected, or conversation_finished.' } }, required: ['reason'] } },
+      { type: 'function', name: 'transfer_to_live_person', description: 'Transfer the active Twilio call to a configured live person after the caller insists, asks a second time, or has urgent/support/billing/existing-customer needs. If transfer is unavailable, Gia should collect callback details instead.', parameters: { type: 'object', properties: { reason: { type: 'string', description: 'Why the caller should be transferred, such as second_live_person_request, urgent_support, billing, customer_service, or existing_customer.' } }, required: ['reason'] } }
+    ];
+    sendToOpenAI({ type: 'session.update', session: { modalities: ['text', 'audio'], instructions: GIA_INSTRUCTIONS, voice: GIA_VOICE, input_audio_format: 'g711_ulaw', output_audio_format: 'g711_ulaw', input_audio_transcription: { model: 'whisper-1' }, turn_detection: { type: 'server_vad', threshold: VAD_THRESHOLD, prefix_padding_ms: VAD_PREFIX_PADDING_MS, silence_duration_ms: VAD_SILENCE_DURATION_MS, create_response: true, interrupt_response: true }, tools: realtimeTools, tool_choice: 'auto', temperature: 0.7, max_response_output_tokens: 700 } });
     sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Start the call now with the approved short Gia greeting.' }] } });
     sendToOpenAI({ type: 'response.create' });
   });
@@ -200,13 +239,19 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
       case 'response.audio.delta': if (msg.delta && streamSid) { noteAssistantAudioQueued(); sendToTwilio({ event: 'media', streamSid, media: { payload: msg.delta } }); } break;
       case 'response.audio_transcript.done': case 'response.output_text.done': pushTranscript('gia', msg.transcript || msg.text || ''); break;
       case 'response.function_call_arguments.done': {
+        let args = {}; try { args = JSON.parse(msg.arguments || '{}'); } catch {}
         if (msg.name === 'end_call') {
-          let args = {}; try { args = JSON.parse(msg.arguments || '{}'); } catch {}
           scheduleEndCall(args.reason || 'gia_end_call_tool');
+        } else if (msg.name === 'transfer_to_live_person') {
+          transferToLivePerson(args.reason || 'live_person_requested').catch(err => {
+            log.warn({ err: err.message }, 'live transfer unavailable; asking Gia to capture callback');
+            sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: Live transfer is unavailable right now. Apologize briefly and collect the caller name, callback number or email, issue, and preferred callback time.' }] } });
+            sendToOpenAI({ type: 'response.create' });
+          });
         }
         break;
       }
-      case 'conversation.item.input_audio_transcription.completed': { const text = msg.transcript || ''; if (isUnclearTranscript(text)) handleUnclearAudio('transcription_completed'); else { unclearCount = 0; pushTranscript('caller', text); if (callerWantsToEnd(text)) { sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller appears to be ending the conversation. Say exactly: "Thanks for calling GetMoreLocalAI. Have a nice day." Then call the end_call tool.' }] } }); sendToOpenAI({ type: 'response.create' }); } } break; }
+      case 'conversation.item.input_audio_transcription.completed': { const text = msg.transcript || ''; if (isUnclearTranscript(text)) handleUnclearAudio('transcription_completed'); else { unclearCount = 0; pushTranscript('caller', text); if (callerWantsToEnd(text)) { sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller appears to be ending the conversation. Say exactly: "Thanks for calling GetMoreLocalAI. Have a nice day." Then call the end_call tool.' }] } }); sendToOpenAI({ type: 'response.create' }); } else if (callerWantsLivePerson(text)) { const liveRequests = transcript.filter(t => t.role === 'caller' && callerWantsLivePerson(t.text)).length; if (liveRequests >= LIVE_TRANSFER_REQUEST_LIMIT || callerNeedsImmediateTransfer(text)) { sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller has asked for a live person more than once or has an urgent/support/customer-service need. Briefly say you will try to connect them now, then call transfer_to_live_person.' }] } }); sendToOpenAI({ type: 'response.create' }); } } } break; }
       case 'conversation.item.input_audio_transcription.failed': handleUnclearAudio('transcription_failed'); break;
       case 'input_audio_buffer.speech_started': if (!echoGuardActive()) { if (streamSid) sendToTwilio({ event: 'clear', streamSid }); if (lastResponseId) sendToOpenAI({ type: 'response.cancel', response_id: lastResponseId }); } else log.info('Ignored speech_started during Gia echo guard window'); break;
       case 'error': log.error({ error: msg.error }, 'OpenAI realtime error'); break;

@@ -19,10 +19,14 @@ const SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || process.env.OPENAI_MOD
 const GIA_VOICE = process.env.GIA_VOICE || 'alloy';
 const MAX_CALL_SECONDS = Number(process.env.GIA_MAX_CALL_SECONDS || 420);
 const MAX_TRANSCRIPT_ITEMS = Number(process.env.GIA_MAX_TRANSCRIPT_ITEMS || 80);
+const VAD_THRESHOLD = Number(process.env.GIA_VAD_THRESHOLD || 0.75);
+const VAD_PREFIX_PADDING_MS = Number(process.env.GIA_VAD_PREFIX_PADDING_MS || 450);
+const VAD_SILENCE_DURATION_MS = Number(process.env.GIA_VAD_SILENCE_DURATION_MS || 1000);
+const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 2);
 
 const GIA_INSTRUCTIONS = `You are Gia, GetMoreLocalAI's transparent AI growth assistant on an inbound phone call.
 
-Tone: natural, warm, concise, consultative. You are an AI assistant; do not pretend to be human. Keep most replies to 1-2 short sentences. Ask one question at a time. Let callers interrupt.
+Tone: natural, warm, concise, consultative. You are an AI assistant; do not pretend to be human. Keep most replies to 1-2 short sentences. Ask one question at a time. Let callers interrupt. Be patient in noisy environments; do not rush to answer while the caller is still speaking.
 
 Opening style after Twilio connects: briefly say: "Hi, you reached GetMoreLocalAI. I'm Gia, the AI growth assistant. What can I help you with today?" Do not list every service in the opening.
 
@@ -33,6 +37,8 @@ Main goal: demonstrate value, qualify the caller, and offer a Free AI Growth & A
 Collect when natural: caller name, business name, location, website, best callback phone/email, main bottleneck, service interest, urgency/timeframe. Do not interrogate; acknowledge their situation first.
 
 Guardrails: never ask for or accept passwords, API keys, payment cards, private credentials, SSNs, medical/legal sensitive details, or Google/Twilio/WordPress logins. If volunteered, tell them not to share credentials and move on. Do not promise guaranteed leads or fixed pricing; say pricing is scoped after the free audit. If caller asks for a human, collect callback details and preferred time. If unsure, offer a free audit or callback.
+
+Noisy-line handling: if the caller audio is unclear, choppy, or appears to be background noise, do not guess. Ask one short clarification such as, "Sorry, I missed that — could you repeat the main issue?" If the line is unclear more than once, switch to fallback capture: say, "It sounds a little noisy on the line. I can still help — what is the best callback number or email so the team can follow up?" Then collect only callback details and preferred time.
 
 Close: when enough info is collected or caller wants to end, summarize next step and say the team will follow up.`;
 
@@ -77,7 +83,7 @@ fastify.all('/twilio/voice', async (req, reply) => {
 
 fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   const connId = Math.random().toString(36).slice(2, 10);
-  let streamSid = null, callSid = null, caller = 'unknown', openaiSocket = null, openaiReady = false, ended = false, lastResponseId = null;
+  let streamSid = null, callSid = null, caller = 'unknown', openaiSocket = null, openaiReady = false, ended = false, lastResponseId = null, unclearCount = 0, lastUnclearPromptAt = 0;
   const transcript = [];
   const startedAt = Date.now();
   const callTimer = setTimeout(() => endCall('max_call_seconds'), MAX_CALL_SECONDS * 1000);
@@ -85,6 +91,22 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   function pushTranscript(role, text) { const clean = safe(text, 2000); if (!clean) return; transcript.push({ ts: new Date().toISOString(), role, text: clean }); while (transcript.length > MAX_TRANSCRIPT_ITEMS) transcript.shift(); }
   function sendToTwilio(obj) { if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.send(JSON.stringify(obj)); }
   function sendToOpenAI(obj) { if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) openaiSocket.send(JSON.stringify(obj)); }
+  function isUnclearTranscript(text) {
+    const t = safe(text, 200).toLowerCase();
+    if (!t) return true;
+    if (t.length < 3) return true;
+    return /\b(inaudible|unintelligible|background noise|noise|silence|unclear|can't understand|cannot understand)\b/.test(t);
+  }
+  function handleUnclearAudio(source) {
+    unclearCount += 1;
+    const now = Date.now();
+    log.info({ source, unclearCount }, 'unclear caller audio detected');
+    if (unclearCount >= UNCLEAR_REPEAT_LIMIT && now - lastUnclearPromptAt > 12000) {
+      lastUnclearPromptAt = now;
+      sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller audio has been unclear or noisy more than once. Use the noisy-line fallback now: briefly say it sounds a little noisy, ask for the best callback number or email, and avoid guessing details.' }] } });
+      sendToOpenAI({ type: 'response.create' });
+    }
+  }
   function endCall(reason) {
     if (ended) return; ended = true; clearTimeout(callTimer); log.info({ reason, callSid }, 'ending Gia realtime call');
     try { if (streamSid) sendToTwilio({ event: 'clear', streamSid }); } catch {}
@@ -96,7 +118,7 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   openaiSocket = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } });
   openaiSocket.on('open', () => {
     openaiReady = true;
-    sendToOpenAI({ type: 'session.update', session: { modalities: ['text', 'audio'], instructions: GIA_INSTRUCTIONS, voice: GIA_VOICE, input_audio_format: 'g711_ulaw', output_audio_format: 'g711_ulaw', input_audio_transcription: { model: 'whisper-1' }, turn_detection: { type: 'server_vad', threshold: 0.55, prefix_padding_ms: 300, silence_duration_ms: 650, create_response: true, interrupt_response: true }, temperature: 0.7, max_response_output_tokens: 700 } });
+    sendToOpenAI({ type: 'session.update', session: { modalities: ['text', 'audio'], instructions: GIA_INSTRUCTIONS, voice: GIA_VOICE, input_audio_format: 'g711_ulaw', output_audio_format: 'g711_ulaw', input_audio_transcription: { model: 'whisper-1' }, turn_detection: { type: 'server_vad', threshold: VAD_THRESHOLD, prefix_padding_ms: VAD_PREFIX_PADDING_MS, silence_duration_ms: VAD_SILENCE_DURATION_MS, create_response: true, interrupt_response: true }, temperature: 0.7, max_response_output_tokens: 700 } });
     sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Start the call now with the approved short Gia greeting.' }] } });
     sendToOpenAI({ type: 'response.create' });
   });
@@ -106,7 +128,8 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
       case 'response.created': lastResponseId = msg.response?.id || lastResponseId; break;
       case 'response.audio.delta': if (msg.delta && streamSid) sendToTwilio({ event: 'media', streamSid, media: { payload: msg.delta } }); break;
       case 'response.audio_transcript.done': case 'response.output_text.done': pushTranscript('gia', msg.transcript || msg.text || ''); break;
-      case 'conversation.item.input_audio_transcription.completed': pushTranscript('caller', msg.transcript || ''); break;
+      case 'conversation.item.input_audio_transcription.completed': { const text = msg.transcript || ''; if (isUnclearTranscript(text)) handleUnclearAudio('transcription_completed'); else { unclearCount = 0; pushTranscript('caller', text); } break; }
+      case 'conversation.item.input_audio_transcription.failed': handleUnclearAudio('transcription_failed'); break;
       case 'input_audio_buffer.speech_started': if (streamSid) sendToTwilio({ event: 'clear', streamSid }); if (lastResponseId) sendToOpenAI({ type: 'response.cancel', response_id: lastResponseId }); break;
       case 'error': log.error({ error: msg.error }, 'OpenAI realtime error'); break;
       default: break;

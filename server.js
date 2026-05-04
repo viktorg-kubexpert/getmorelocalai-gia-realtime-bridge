@@ -22,7 +22,8 @@ const MAX_TRANSCRIPT_ITEMS = Number(process.env.GIA_MAX_TRANSCRIPT_ITEMS || 80);
 const VAD_THRESHOLD = Number(process.env.GIA_VAD_THRESHOLD || 0.75);
 const VAD_PREFIX_PADDING_MS = Number(process.env.GIA_VAD_PREFIX_PADDING_MS || 450);
 const VAD_SILENCE_DURATION_MS = Number(process.env.GIA_VAD_SILENCE_DURATION_MS || 1000);
-const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 2);
+const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 3);
+const UNCLEAR_FALLBACK_COOLDOWN_MS = Number(process.env.GIA_UNCLEAR_FALLBACK_COOLDOWN_MS || 25000);
 const END_CALL_DELAY_MS = Number(process.env.GIA_END_CALL_DELAY_MS || 2500);
 const AUDIO_MODE = (process.env.GIA_AUDIO_MODE || '').toLowerCase() || (String(process.env.GIA_ECHO_SUPPRESSION || 'true').toLowerCase() === 'false' ? 'full_duplex' : 'half_duplex');
 const ECHO_SUPPRESSION_ENABLED = AUDIO_MODE !== 'full_duplex' && String(process.env.GIA_ECHO_SUPPRESSION || 'true').toLowerCase() !== 'false';
@@ -44,9 +45,9 @@ Collect when natural: caller name, business name, location, website, best callba
 
 Guardrails: never ask for or accept passwords, API keys, payment cards, private credentials, SSNs, medical/legal sensitive details, or Google/Twilio/WordPress logins. If volunteered, tell them not to share credentials and move on. Do not promise guaranteed leads or fixed pricing; say pricing is scoped after the free audit. If caller asks for a human, collect callback details and preferred time. If unsure, offer a free audit or callback.
 
-Noisy-line handling: if the caller audio is unclear, choppy, or appears to be background noise, do not guess. Ask one short clarification such as, "Sorry, I missed that — could you repeat the main issue?" If the line is unclear more than once, switch to fallback capture: say, "It sounds a little noisy on the line. I can still help — what is the best callback number or email so the team can follow up?" Then collect only callback details and preferred time.
+Unclear-audio handling: do not mention noise unless the caller audio is repeatedly unusable. For one missed or partial utterance, use a neutral clarification such as, "Sorry, I missed part of that — could you repeat the main issue?" If understanding fails repeatedly, switch to fallback capture without blaming the caller: say, "I may be missing part of what you're saying. I can still help — what's the best callback number or email so the team can follow up?" Then collect only callback details and preferred time. Treat short normal answers like yes, no, okay, bye, thanks, and all set as valid caller input, not unclear audio.
 
-Close: when enough info is collected or caller wants to end, say one brief closing sentence such as, "Thanks — the team will follow up. Have a great day." Then call the end_call tool. If the caller says goodbye, thanks, that's all, no more questions, or clearly ends the conversation, acknowledge briefly and call the end_call tool. Do not leave the line open after the conversation is finished.`;
+Close: when enough info is collected or caller wants to end, say exactly one brief friendly closing sentence such as, "Thanks for calling GetMoreLocalAI. Have a nice day." Then call the end_call tool. If the caller says goodbye, bye, thanks, that's all, no more questions, or clearly ends the conversation, acknowledge briefly with "Thanks for calling GetMoreLocalAI. Have a nice day." and call the end_call tool. Do not leave the line open after the conversation is finished.`;
 
 function xmlEscape(value) { return String(value || '').replace(/[<>&"']/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[ch])); }
 function htmlEscape(value) { return String(value || '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])); }
@@ -140,6 +141,7 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
   function isUnclearTranscript(text) {
     const t = safe(text, 200).toLowerCase();
     if (!t) return true;
+    if (/^(yes|yeah|yep|no|nope|ok|okay|sure|right|correct|bye|goodbye|thanks|thank you|all set|nothing else|that's all|that is all)[.!? ]*$/.test(t)) return false;
     if (t.length < 3) return true;
     return /\b(inaudible|unintelligible|background noise|noise|silence|unclear|can't understand|cannot understand)\b/.test(t);
   }
@@ -147,9 +149,9 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
     unclearCount += 1;
     const now = Date.now();
     log.info({ source, unclearCount }, 'unclear caller audio detected');
-    if (unclearCount >= UNCLEAR_REPEAT_LIMIT && now - lastUnclearPromptAt > 12000) {
+    if (unclearCount >= UNCLEAR_REPEAT_LIMIT && now - lastUnclearPromptAt > UNCLEAR_FALLBACK_COOLDOWN_MS) {
       lastUnclearPromptAt = now;
-      sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller audio has been unclear or noisy more than once. Use the noisy-line fallback now: briefly say it sounds a little noisy, ask for the best callback number or email, and avoid guessing details.' }] } });
+      sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller audio or transcription has failed repeatedly. Do not say the line is noisy unless the caller explicitly sounds noisy. Use fallback capture now: say you may be missing part of what they are saying, ask for the best callback number or email, and avoid guessing details.' }] } });
       sendToOpenAI({ type: 'response.create' });
     }
   }
@@ -190,7 +192,7 @@ fastify.get('/twilio/media', { websocket: true }, (twilioSocket, req) => {
         }
         break;
       }
-      case 'conversation.item.input_audio_transcription.completed': { const text = msg.transcript || ''; if (isUnclearTranscript(text)) handleUnclearAudio('transcription_completed'); else { unclearCount = 0; pushTranscript('caller', text); if (callerWantsToEnd(text)) { sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller appears to be ending the conversation. Give one brief friendly closing sentence, then call the end_call tool.' }] } }); sendToOpenAI({ type: 'response.create' }); } } break; }
+      case 'conversation.item.input_audio_transcription.completed': { const text = msg.transcript || ''; if (isUnclearTranscript(text)) handleUnclearAudio('transcription_completed'); else { unclearCount = 0; pushTranscript('caller', text); if (callerWantsToEnd(text)) { sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller appears to be ending the conversation. Say exactly: "Thanks for calling GetMoreLocalAI. Have a nice day." Then call the end_call tool.' }] } }); sendToOpenAI({ type: 'response.create' }); } } break; }
       case 'conversation.item.input_audio_transcription.failed': handleUnclearAudio('transcription_failed'); break;
       case 'input_audio_buffer.speech_started': if (!echoGuardActive()) { if (streamSid) sendToTwilio({ event: 'clear', streamSid }); if (lastResponseId) sendToOpenAI({ type: 'response.cancel', response_id: lastResponseId }); } else log.info('Ignored speech_started during Gia echo guard window'); break;
       case 'error': log.error({ error: msg.error }, 'OpenAI realtime error'); break;

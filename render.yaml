@@ -27,6 +27,10 @@ services:
         value: "120"
       - key: GIA_ECHO_MAX_MUTE_MS
         value: "8000"
+      - key: GIA_UNCLEAR_REPEAT_LIMIT
+        value: "3"
+      - key: GIA_UNCLEAR_FALLBACK_COOLDOWN_MS
+        value: "25000"
       - key: SEND_SUMMARY_EMAIL
         value: "true"
       - key: SMTP_HOST

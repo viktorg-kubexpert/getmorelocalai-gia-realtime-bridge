@@ -1,4 +1,4 @@
-import 'dotenv/config';
+Close: when enough info is collected or caller wants to end, say one brief closing sentence such as, "Thanks — the team will follow up. Have a great day." Then call the end_call tool. If the caller says goodbye, thanks, that's all, no more questions, or clearly ends the conversation, acknowledge briefly and call the end_call tool. Do not leave the line open after the conversation is finished.`;import 'dotenv/config';
 import Fastify from 'fastify';
 import websocketPlugin from '@fastify/websocket';
 import formbodyPlugin from '@fastify/formbody';
@@ -15,11 +15,14 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 const BRIDGE_TOKEN = process.env.GIA_BRIDGE_TOKEN || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
-const SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const SUMMARY_MODEL = process.env.OPENAI_SUMMARY_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-minconst UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 2);
+const END_CALL_DELAY_MS = Number(process.env.GIA_END_CALL_DELAY_MS || 2500);const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 2);
+const END_CALL_DELAY_MS = Number(process.env.GIA_END_CALL_DELAY_MS || 2500);i';
 const GIA_VOICE = process.env.GIA_VOICE || 'alloy';
 const MAX_CALL_SECONDS = Number(process.env.GIA_MAX_CALL_SECONDS || 420);
 const MAX_TRANSCRIPT_ITEMS = Number(process.env.GIA_MAX_TRANSCRIPT_ITEMS || 80);
 const VAD_THRESHOLD = Number(process.env.GIA_VAD_THRESHOLD || 0.75);
+  <Hangup />
 const VAD_PREFIX_PADDING_MS = Number(process.env.GIA_VAD_PREFIX_PADDING_MS || 450);
 const VAD_SILENCE_DURATION_MS = Number(process.env.GIA_VAD_SILENCE_DURATION_MS || 1000);
 const UNCLEAR_REPEAT_LIMIT = Number(process.env.GIA_UNCLEAR_REPEAT_LIMIT || 2);
@@ -51,6 +54,22 @@ function validateTwilioHttp(req) {
   if (!authToken || String(process.env.SKIP_TWILIO_SIGNATURE_VALIDATION || '').toLowerCase() === 'true') return true;
   const signature = req.headers['x-twilio-signature'];
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+        if (msg.name === 'end_call') {
+          let args = {}; try { args = JSON.parse(msg.arguments || '{}'); } catch {}
+          scheduleEndCall(args.reason || 'gia_end_call_tool');
+        }
+        break;
+      }
+      case 'conversation.item.input_audio_transcription.completed': { const text = msg.transcript || ''; if (isUnclearTranscript(text)) handleUnclearAudio('transcription_completed'); else { unclearCount = 0; pushTranscript('caller', text); if (callerWantsToEnd(text)) { sendToOpenAI({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System note: The caller appears to be ending the conversation. Give one brief friendly closing sentence, then call the end_call tool.' }] } }); sendToOpenAI({ type: 'response.create' }); } } break; }}, tools: [{ type: 'function', name: 'end_call', description: 'End the phone call after Gia has given a brief closing sentence and the caller is finished.', parameters: { type: 'object', properties: { reason: { type: 'string', description: 'Short reason the call should end, such as caller_goodbye, completed_intake, callback_collected, or conversation_finished.' } }, required: ['reason'] } }], tool_choice: 'auto', temperature: 0.7, max_response_output_tokens: 700 } });  function callerWantsToEnd(text) {
+    const t = safe(text, 500).toLowerCase();
+    return /\b(goodbye|bye|bye bye|that'?s all|that is all|no more questions|nothing else|i'?m all set|all set|thank you,? bye|thanks,? bye|have a good (day|night|one))\b/.test(t);
+  }
+  function scheduleEndCall(reason) {
+    if (ended) return;
+    log.info({ reason, delayMs: END_CALL_DELAY_MS }, 'scheduling Gia call hangup');
+    setTimeout(() => endCall(reason), END_CALL_DELAY_MS);
+  }
+  function endCall(reason) {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   const url = `${proto}://${host}${req.raw.url}`;
   return twilio.validateRequest(authToken, signature, url, req.body || {});
